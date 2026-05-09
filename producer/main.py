@@ -1,24 +1,24 @@
 """Async producer.
 
-Why async here:
-- Submission is pure I/O (validate → LPUSH → respond). Async lets one process
-  handle thousands of concurrent enqueues with one connection pool.
-- This is also where you'd add auth, rate limiting, idempotency keys — all
-  things that benefit from async middleware.
-
-Why we still keep it tiny: every async footgun (event loop blocking, mixing
-sync libs, forgotten awaits) pays interest forever. The producer should do
-exactly one job — accept and enqueue — and nothing else.
+Stage 2 changes vs Stage 1:
+- Job rows are inserted into Postgres first (status='queued'), then the ID is
+  pushed to Redis. Order matters: if the INSERT succeeds and the RPUSH fails,
+  the row exists but is invisible to workers. Stage 3's reaper will sweep
+  these orphans by re-pushing rows with status='queued' that aren't on a list.
+- The wire envelope on Redis is now just `{"id": "..."}` — Postgres holds the
+  full payload.
 """
 from __future__ import annotations
 
+import json
 import logging
 from contextlib import asynccontextmanager
 
 import redis.asyncio as aioredis
 from fastapi import FastAPI, HTTPException
 
-from core.job import EnqueueRequest, EnqueueResponse, Job
+from core import db
+from core.job import EnqueueRequest, EnqueueResponse, Job, WireEnvelope
 from core.settings import queue_key, settings
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -27,7 +27,9 @@ log = logging.getLogger("producer")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # One pool per process. redis-py's async client pools internally.
+    # Postgres pool + run migrations once on boot.
+    await db.run_migrations_async()
+    # Redis pool.
     app.state.redis = aioredis.from_url(settings.redis_url, decode_responses=False)
     try:
         await app.state.redis.ping()
@@ -35,6 +37,7 @@ async def lifespan(app: FastAPI):
         yield
     finally:
         await app.state.redis.aclose()
+        await db.aclose()
 
 
 app = FastAPI(title="mini-job-queue producer", lifespan=lifespan)
@@ -44,23 +47,36 @@ app = FastAPI(title="mini-job-queue producer", lifespan=lifespan)
 async def healthz() -> dict[str, str]:
     try:
         await app.state.redis.ping()
-    except Exception as e:  # noqa: BLE001 — health endpoint must not raise
-        raise HTTPException(status_code=503, detail=f"redis unreachable: {e}")
+        async with db.aconnection() as conn, conn.cursor() as cur:
+            await cur.execute("SELECT 1")
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=503, detail=f"unhealthy: {e}")
     return {"status": "ok"}
 
 
 @app.post("/jobs", response_model=EnqueueResponse, status_code=202)
 async def enqueue(req: EnqueueRequest) -> EnqueueResponse:
-    """Accept a job and push it onto the default queue.
+    """Insert the row, commit, then push the ID to Redis.
 
-    202 Accepted (not 200) because the work hasn't been done — only enqueued.
-    Stage 1 has no validation that req.type is a known handler; that lookup
-    happens worker-side. We could add a registry on the producer too, but it
-    would mean producer and worker must deploy in lockstep, which is annoying
-    for a real system. Keep them loosely coupled.
+    Why insert-then-push (and not the reverse): if we pushed first and crashed
+    before INSERT, a worker could BLPOP an ID that has no row — every claim
+    would fail forever. Insert-first means the worst case is a row visible in
+    the table that no worker sees yet; the Stage 3 reaper handles that.
     """
-    job = Job(type=req.type, args=req.args)
-    # RPUSH + BLPOP gives FIFO. (LPUSH + BRPOP would also work; pick one and stick.)
-    await app.state.redis.rpush(queue_key(settings.default_queue), job.to_wire())
-    log.info("enqueued id=%s type=%s queue=%s", job.id, job.type, settings.default_queue)
-    return EnqueueResponse(id=job.id, queue=settings.default_queue)
+    job = Job(type=req.type, args=req.args, max_attempts=req.max_attempts)
+
+    async with db.aconnection() as conn, conn.cursor() as cur:
+        await cur.execute(
+            """
+            INSERT INTO jobs (id, type, args, status, queue, max_attempts)
+            VALUES (%s, %s, %s::jsonb, 'queued', %s, %s)
+            """,
+            (str(job.id), job.type, json.dumps(job.args), job.queue, job.max_attempts),
+        )
+        await conn.commit()
+
+    # Row is durable. Now signal workers.
+    envelope = WireEnvelope(id=job.id)
+    await app.state.redis.rpush(queue_key(job.queue), envelope.to_wire())
+    log.info("enqueued id=%s type=%s queue=%s", job.id, job.type, job.queue)
+    return EnqueueResponse(id=job.id, queue=job.queue, status="queued")

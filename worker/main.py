@@ -1,20 +1,19 @@
 """Sync worker process.
 
-Why sync:
-- Once we're executing user code, we want to be able to call ANY library —
-  psycopg, requests, pandas, ffmpeg subprocess wrappers — without worrying
-  whether it's async-safe. A sync worker just runs the function.
-- Crash isolation: each worker is a separate process. One worker dies, the
-  others keep going. (Run them under systemd or a process manager in prod.)
-- Real CPU parallelism. Async gives you concurrency, not parallelism. For
-  CPU-bound work N worker processes beat N async tasks.
+Stage 2 changes vs Stage 1:
+- BLPOP returns just an ID. The worker fetches and claims the row with
+  SELECT ... FOR UPDATE SKIP LOCKED, transitions it through running → done/failed,
+  and writes errors back to the row.
+- A handler exception no longer just logs — it sets status='failed' and stores
+  the traceback in the `error` column. Retry logic comes in Stage 4.
 
-The loop:
-  1) BLPOP with a small timeout (so we can poll _shutdown between blocks).
-  2) Decode the Job. If decoding fails, log loudly and drop — that payload
-     is corrupt and re-trying won't help.
-  3) Dispatch to the handler. Catch everything. In Stage 1 we just log; in
-     Stage 4 this is where retries get scheduled.
+Why SELECT FOR UPDATE SKIP LOCKED:
+- FOR UPDATE: take a row-level lock so no other worker can grab the same job.
+- SKIP LOCKED: if another worker already locked it, don't block — move on.
+  This is what makes the queue scale: every worker proceeds independently.
+- Combined with `WHERE status='queued'`: protects against double-delivery if
+  Redis ever re-pushes the same ID (which it can, in failure modes we'll
+  cover in later stages).
 """
 from __future__ import annotations
 
@@ -28,13 +27,13 @@ from types import FrameType
 
 import redis
 
+from core import db
 from core.handlers import get as get_handler
 from core.handlers import known_types
-from core.job import Job
+from core.job import WireEnvelope
 from core.settings import queue_key, settings
 
 # Side-effect import: registers the example handlers via @register.
-# In your own deploys you'd import whichever module(s) define your handlers.
 import examples.handlers  # noqa: F401
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -49,34 +48,83 @@ def _on_signal(signum: int, _frame: FrameType | None) -> None:
     _shutdown = True
 
 
-def _process(raw: bytes) -> None:
-    """Decode and run a single job. Exceptions are logged, not re-raised."""
-    try:
-        job = Job.from_wire(raw)
-    except Exception:
-        log.error("could not decode job payload, dropping. raw=%r", raw[:200])
-        log.error(traceback.format_exc())
-        return
+def _claim_and_run(job_id: str) -> None:
+    """Claim the row, run the handler, mark final status.
 
-    log.info("running id=%s type=%s", job.id, job.type)
+    All three transitions (claim, success, failure) commit independently so a
+    crash in handler code can't roll back the 'running' marker — the row is
+    visible as 'running' in the dashboard, and Stage 3's reaper will reclaim
+    it if the worker doesn't update it within the heartbeat window.
+    """
+    with db.connection() as conn, conn.cursor() as cur:
+        # Claim. If the row was already claimed (status != queued) or another
+        # worker holds the lock, this returns no rows and we just bail.
+        cur.execute(
+            """
+            UPDATE jobs
+               SET status = 'running',
+                   attempts = attempts + 1,
+                   started_at = now()
+             WHERE id = (
+                 SELECT id FROM jobs
+                  WHERE id = %s AND status = 'queued'
+                  FOR UPDATE SKIP LOCKED
+             )
+         RETURNING type, args
+            """,
+            (job_id,),
+        )
+        row = cur.fetchone()
+        if row is None:
+            conn.commit()
+            log.info("id=%s not claimable (already running/done, or locked)", job_id)
+            return
+        job_type, args = row
+        conn.commit()
+
+    log.info("running id=%s type=%s", job_id, job_type)
     started = time.monotonic()
+
+    # Run the handler OUTSIDE the DB transaction. Holding a DB connection
+    # while running arbitrary user code is asking for connection-pool starvation.
     try:
-        handler = get_handler(job.type)
-        handler(**job.args)
+        handler = get_handler(job_type)
+        handler(**(args or {}))
     except LookupError as e:
-        # Unknown type — handler not registered in this worker. In Stage 4 we'd
-        # send this to the DLQ; for now we just log and move on.
-        log.error("id=%s %s", job.id, e)
+        _mark_failed(job_id, f"unknown handler: {e}")
+        log.error("id=%s %s", job_id, e)
         return
     except Exception:
-        # Handler raised. Stage 4 will catch this and schedule a retry.
+        tb = traceback.format_exc()
+        _mark_failed(job_id, tb)
         elapsed = time.monotonic() - started
-        log.error("id=%s FAILED after %.2fs", job.id, elapsed)
-        log.error(traceback.format_exc())
+        log.error("id=%s FAILED after %.2fs", job_id, elapsed)
+        log.error(tb)
         return
 
+    _mark_done(job_id)
     elapsed = time.monotonic() - started
-    log.info("id=%s done in %.2fs", job.id, elapsed)
+    log.info("id=%s done in %.2fs", job_id, elapsed)
+
+
+def _mark_done(job_id: str) -> None:
+    with db.connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            "UPDATE jobs SET status='done', completed_at=now(), error=NULL WHERE id=%s",
+            (job_id,),
+        )
+        conn.commit()
+
+
+def _mark_failed(job_id: str, error: str) -> None:
+    # Truncate so a wild stack trace can't bloat the row.
+    error = error[:8000]
+    with db.connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            "UPDATE jobs SET status='failed', completed_at=now(), error=%s WHERE id=%s",
+            (error, job_id),
+        )
+        conn.commit()
 
 
 def main() -> int:
@@ -84,6 +132,10 @@ def main() -> int:
     signal.signal(signal.SIGTERM, _on_signal)
 
     log.info("starting. queue=%s handlers=%s", settings.default_queue, known_types())
+
+    # Ensure schema is up to date before workers start consuming.
+    db.run_migrations_sync()
+
     r = redis.Redis.from_url(settings.redis_url)
     try:
         r.ping()
@@ -94,21 +146,27 @@ def main() -> int:
     qkey = queue_key(settings.default_queue)
     while not _shutdown:
         try:
-            # BLPOP returns (queue_name, payload) or None on timeout.
-            # The timeout is what lets us check _shutdown periodically.
             popped = r.blpop([qkey], timeout=settings.blpop_timeout)
         except redis.RedisError as e:
-            # Connection blip — back off briefly and retry. redis-py reconnects on next call.
             log.warning("redis error during BLPOP: %s — retrying in 1s", e)
             time.sleep(1)
             continue
 
         if popped is None:
-            continue  # timeout, loop and check _shutdown
+            continue
         _, raw = popped
-        _process(raw)
+
+        try:
+            envelope = WireEnvelope.from_wire(raw)
+        except Exception:
+            log.error("could not decode envelope, dropping. raw=%r", raw[:200])
+            log.error(traceback.format_exc())
+            continue
+
+        _claim_and_run(str(envelope.id))
 
     log.info("clean shutdown")
+    db.close_sync()
     return 0
 
 
