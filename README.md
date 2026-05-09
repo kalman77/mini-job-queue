@@ -1,57 +1,39 @@
 # mini-job-queue
 
-Async producer (FastAPI) → Redis broker → sync workers, with **Postgres as
-the source of truth**.
+Async producer (FastAPI) → Redis broker → sync workers → Postgres state →
+**reaper** that recovers from worker crashes and producer-side orphans.
 
-You're now at the end of **Stage 2**. Compared to Stage 1 the queue is
-durable: jobs survive Redis restarts, statuses are queryable, and failures
-are recorded. The Stage 1 fire-and-forget contract is gone — every job
-leaves an audit trail.
+You're now at the end of **Stage 3**. The system is self-healing:
+- A killed worker no longer leaves jobs stuck in `running` — heartbeats go
+  stale, the reaper requeues them.
+- A producer crash between INSERT and RPUSH no longer loses jobs — the
+  reaper recovers orphans.
+- Each worker has a stable identity (`locked_by`), so completion writes
+  can't trample a row that was reclaimed by a different worker.
 
 ## Layout
 
 ```
 core/
   __init__.py
-  settings.py        # env config (REDIS_URL, DATABASE_URL, ...)
-  job.py             # Job (DB row), WireEnvelope (Redis payload), HTTP schemas
-  handlers.py        # @register decorator, registry lookup
-  db.py              # sync + async psycopg pools, migration runner          [new]
-  migrations.sql     # jobs table schema                                      [new]
+  settings.py        # env config (heartbeat, reaper intervals)
+  job.py             # Job (DB row), WireEnvelope (Redis payload)
+  handlers.py        # @register decorator
+  db.py              # sync + async psycopg pools, migration runner
+  migrations.sql     # jobs table + indexes
+  heartbeat.py       # Heartbeat context manager (background thread)         [new]
 producer/
-  __init__.py
-  main.py            # FastAPI: POST /jobs writes row, then RPUSH id
+  main.py            # POST /jobs writes row, RPUSHes id
 worker/
+  main.py            # claims with FOR UPDATE SKIP LOCKED, runs under Heartbeat
+scheduler/
   __init__.py
-  main.py            # BLPOP id, claim with FOR UPDATE SKIP LOCKED, run, mark
-scheduler/           # empty for now (Stage 5: delayed jobs, retry promotion)
+  reaper.py          # reap_stale_running, recover_orphans, run_forever     [new]
+  main.py            # long-running reaper process entrypoint               [new]
 examples/
-  __init__.py
   handlers.py        # send_email, slow_task, always_fails
 smoke_test.py
 requirements.txt
-```
-
-## Prerequisites
-
-- Python 3.11+
-- Redis on :6379
-- Postgres on :5432 with a database the app can write to
-
-The fastest path is Docker:
-```bash
-docker run --rm -d -p 6379:6379 --name mjq-redis redis:7-alpine
-docker run --rm -d -p 5432:5432 --name mjq-pg \
-  -e POSTGRES_USER=mjq -e POSTGRES_PASSWORD=mjq -e POSTGRES_DB=mjq \
-  postgres:16-alpine
-```
-
-## Install
-
-```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
 ```
 
 ## Run
@@ -60,44 +42,62 @@ pip install -r requirements.txt
 # Producer (terminal 1)
 uvicorn producer.main:app --reload --port 8000
 
-# Worker (terminal 2 — run several in parallel to feel concurrency)
+# Worker (terminal 2 — run several)
 python -m worker.main
+
+# Reaper (terminal 3 — exactly one in normal use)
+python -m scheduler.main
 ```
 
-Migrations run automatically on producer or worker startup.
+## Configuration
 
-## Try it
+Reasonable defaults; tune via env vars when you understand the trade-offs:
 
+| Env var | Default | Meaning |
+|---|---|---|
+| `HEARTBEAT_INTERVAL_SEC` | 5 | How often a running worker bumps `last_heartbeat_at` |
+| `HEARTBEAT_TIMEOUT_SEC` | 30 | Beyond this, the reaper considers the worker dead. **Must be ≫ interval** — 4-6× is a good rule. |
+| `REAPER_INTERVAL_SEC` | 5 | Reaper scan period |
+| `ORPHAN_TIMEOUT_SEC` | 60 | Age threshold for re-pushing `queued` rows that aren't on Redis |
+
+## Try the failure modes
+
+**Kill a worker mid-job:**
 ```bash
+# enqueue a 30s job
 curl -X POST http://localhost:8000/jobs \
   -H "content-type: application/json" \
-  -d '{"type": "send_email", "args": {"to": "you@example.com", "subject": "hi"}}'
-```
-
-Then inspect the row:
-```bash
+  -d '{"type": "slow_task", "args": {"seconds": 30}}'
+# kill the worker process while it's running (kill -9 to skip clean shutdown)
+# inspect the row — status will be 'running' with a stale heartbeat
 docker exec -it mjq-pg psql -U mjq -d mjq -c \
-  "SELECT id, type, status, attempts, started_at, completed_at, error FROM jobs ORDER BY enqueued_at DESC LIMIT 5;"
+  "SELECT id, status, attempts, last_heartbeat_at, locked_by FROM jobs ORDER BY enqueued_at DESC LIMIT 5;"
+# wait HEARTBEAT_TIMEOUT_SEC seconds, watch the reaper log
+# row goes back to 'queued', another worker picks it up, attempts=2
 ```
 
-You'll see the row transition `queued` → `running` → `done` (or `failed` if
-you used `always_fails`).
+**Producer crash between INSERT and RPUSH** (harder to reproduce — easiest is
+to insert a row directly with psql and skip the RPUSH; the reaper picks it
+up after `ORPHAN_TIMEOUT_SEC`).
 
 ## What's still missing
 
-- **Heartbeats / reaping (Stage 3).** Kill a worker mid-job and the row is
-  stuck in `running` forever. The reaper will detect this and re-enqueue.
-- **Retries with backoff (Stage 4).** A failed job stays failed. We'll push
-  it back via a `scheduled_at` ZSET on Redis with exponential backoff + jitter.
-- **Priorities, scheduled jobs (Stage 5).** Multiple queue lists; future-dated jobs.
+- **Retries with backoff (Stage 4).** Failures stay failed. We'll push
+  failed jobs back to Redis (or a `scheduled` ZSET) with exponential backoff
+  and jitter, capped by `max_attempts`.
+- **Priorities, scheduled jobs (Stage 5).**
 - **DLQ + dashboard (Stage 6).**
 
-## Running the smoke test
+## Smoke test
 
 ```bash
 python smoke_test.py
 ```
 
-This uses fakeredis + an in-memory psycopg substitute, so it doesn't need a
-running Redis or Postgres. It verifies enqueue inserts a row, the row claim
-under SKIP LOCKED works, and status transitions land correctly.
+Six tests, all run against an embedded Postgres (no Docker required):
+1. Heartbeat advances `last_heartbeat_at` while a handler runs.
+2. Reaper requeues a stale running row, the next worker reclaims it.
+3. Reaper does NOT touch a fresh running row.
+4. Orphan recovery pushes a missing id back to Redis.
+5. Orphan recovery is idempotent w.r.t. Redis presence.
+6. `_mark_done` won't overwrite a row owned by a different worker (fencing).

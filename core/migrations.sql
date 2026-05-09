@@ -1,6 +1,5 @@
 -- mini-job-queue schema. Idempotent: safe to run on every startup.
--- Stage 2 only needs the jobs table. Stages 3-5 will add columns
--- (heartbeat, scheduled_at, priority) via additive migrations.
+-- Stage 3: adds heartbeat tracking and worker identity.
 
 CREATE TABLE IF NOT EXISTS jobs (
     id            UUID         PRIMARY KEY,
@@ -16,7 +15,21 @@ CREATE TABLE IF NOT EXISTS jobs (
     error         TEXT
 );
 
--- Speeds up dashboard queries like "show me failed jobs on queue default"
--- and the worker's row-claim path. Status is the most selective column,
--- queue second, so leading with status is right.
+-- Stage 3 additions. Wrapped in DO blocks so they're idempotent on
+-- existing tables. (ALTER TABLE ... ADD COLUMN IF NOT EXISTS works in pg 9.6+
+-- but DO blocks make the intent explicit and let us add CHECKs/indexes safely.)
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS last_heartbeat_at TIMESTAMPTZ;
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS locked_by         TEXT;
+
 CREATE INDEX IF NOT EXISTS jobs_status_queue_idx ON jobs (status, queue);
+
+-- Speeds up the reaper scan. Partial indexes are great here: only the rows
+-- the reaper actually queries get indexed, keeping the index tiny even when
+-- the table grows large with completed jobs.
+CREATE INDEX IF NOT EXISTS jobs_running_heartbeat_idx
+    ON jobs (last_heartbeat_at)
+    WHERE status = 'running';
+
+CREATE INDEX IF NOT EXISTS jobs_queued_enqueued_idx
+    ON jobs (enqueued_at)
+    WHERE status = 'queued';

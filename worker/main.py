@@ -1,28 +1,23 @@
 """Sync worker process.
 
-Stage 2 changes vs Stage 1:
-- BLPOP returns just an ID. The worker fetches and claims the row with
-  SELECT ... FOR UPDATE SKIP LOCKED, transitions it through running → done/failed,
-  and writes errors back to the row.
-- A handler exception no longer just logs — it sets status='failed' and stores
-  the traceback in the `error` column. Retry logic comes in Stage 4.
-
-Why SELECT FOR UPDATE SKIP LOCKED:
-- FOR UPDATE: take a row-level lock so no other worker can grab the same job.
-- SKIP LOCKED: if another worker already locked it, don't block — move on.
-  This is what makes the queue scale: every worker proceeds independently.
-- Combined with `WHERE status='queued'`: protects against double-delivery if
-  Redis ever re-pushes the same ID (which it can, in failure modes we'll
-  cover in later stages).
+Stage 3 changes vs Stage 2:
+- Each worker has a stable identity (worker_id) it stamps onto the row
+  when it claims. The heartbeat thread updates last_heartbeat_at while
+  scoped to that identity, so a reaped-and-resubmitted job claimed by
+  another worker won't be heartbeated by the original worker thread.
+- The handler runs inside a Heartbeat context manager. The context manager
+  starts a background thread that updates last_heartbeat_at on a timer.
 """
 from __future__ import annotations
 
 import logging
 import os
 import signal
+import socket
 import sys
 import time
 import traceback
+import uuid
 from types import FrameType
 
 import redis
@@ -30,6 +25,7 @@ import redis
 from core import db
 from core.handlers import get as get_handler
 from core.handlers import known_types
+from core.heartbeat import Heartbeat
 from core.job import WireEnvelope
 from core.settings import queue_key, settings
 
@@ -38,6 +34,11 @@ import examples.handlers  # noqa: F401
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger(f"worker[{os.getpid()}]")
+
+# Stable identity for this worker process. host:pid:short-uuid is enough
+# entropy that you can run dozens of workers across machines without collision,
+# and the host/pid prefix is useful when reading the column in psql.
+WORKER_ID = f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex[:8]}"
 
 _shutdown = False
 
@@ -49,22 +50,17 @@ def _on_signal(signum: int, _frame: FrameType | None) -> None:
 
 
 def _claim_and_run(job_id: str) -> None:
-    """Claim the row, run the handler, mark final status.
-
-    All three transitions (claim, success, failure) commit independently so a
-    crash in handler code can't roll back the 'running' marker — the row is
-    visible as 'running' in the dashboard, and Stage 3's reaper will reclaim
-    it if the worker doesn't update it within the heartbeat window.
-    """
+    """Claim the row, run the handler under a heartbeat, mark final status."""
     with db.connection() as conn, conn.cursor() as cur:
-        # Claim. If the row was already claimed (status != queued) or another
-        # worker holds the lock, this returns no rows and we just bail.
         cur.execute(
             """
             UPDATE jobs
                SET status = 'running',
                    attempts = attempts + 1,
-                   started_at = now()
+                   started_at = COALESCE(started_at, now()),
+                   last_heartbeat_at = now(),
+                   locked_by = %s,
+                   error = NULL
              WHERE id = (
                  SELECT id FROM jobs
                   WHERE id = %s AND status = 'queued'
@@ -72,7 +68,7 @@ def _claim_and_run(job_id: str) -> None:
              )
          RETURNING type, args
             """,
-            (job_id,),
+            (WORKER_ID, job_id),
         )
         row = cur.fetchone()
         if row is None:
@@ -82,18 +78,19 @@ def _claim_and_run(job_id: str) -> None:
         job_type, args = row
         conn.commit()
 
-    log.info("running id=%s type=%s", job_id, job_type)
+    log.info("running id=%s type=%s worker=%s", job_id, job_type, WORKER_ID)
     started = time.monotonic()
 
-    # Run the handler OUTSIDE the DB transaction. Holding a DB connection
-    # while running arbitrary user code is asking for connection-pool starvation.
     try:
         handler = get_handler(job_type)
-        handler(**(args or {}))
     except LookupError as e:
         _mark_failed(job_id, f"unknown handler: {e}")
         log.error("id=%s %s", job_id, e)
         return
+
+    try:
+        with Heartbeat(job_id, WORKER_ID):
+            handler(**(args or {}))
     except Exception:
         tb = traceback.format_exc()
         _mark_failed(job_id, tb)
@@ -109,20 +106,38 @@ def _claim_and_run(job_id: str) -> None:
 
 def _mark_done(job_id: str) -> None:
     with db.connection() as conn, conn.cursor() as cur:
+        # Predicate the update on locked_by: a reaped-and-reclaimed job
+        # whose original worker eventually finishes must NOT mark itself done.
+        # The new worker owns the outcome.
         cur.execute(
-            "UPDATE jobs SET status='done', completed_at=now(), error=NULL WHERE id=%s",
-            (job_id,),
+            """
+            UPDATE jobs
+               SET status='done',
+                   completed_at=now(),
+                   last_heartbeat_at=NULL,
+                   locked_by=NULL,
+                   error=NULL
+             WHERE id=%s AND locked_by=%s
+            """,
+            (job_id, WORKER_ID),
         )
         conn.commit()
 
 
 def _mark_failed(job_id: str, error: str) -> None:
-    # Truncate so a wild stack trace can't bloat the row.
     error = error[:8000]
     with db.connection() as conn, conn.cursor() as cur:
         cur.execute(
-            "UPDATE jobs SET status='failed', completed_at=now(), error=%s WHERE id=%s",
-            (error, job_id),
+            """
+            UPDATE jobs
+               SET status='failed',
+                   completed_at=now(),
+                   last_heartbeat_at=NULL,
+                   locked_by=NULL,
+                   error=%s
+             WHERE id=%s AND locked_by=%s
+            """,
+            (error, job_id, WORKER_ID),
         )
         conn.commit()
 
@@ -131,9 +146,9 @@ def main() -> int:
     signal.signal(signal.SIGINT, _on_signal)
     signal.signal(signal.SIGTERM, _on_signal)
 
-    log.info("starting. queue=%s handlers=%s", settings.default_queue, known_types())
+    log.info("starting. id=%s queue=%s handlers=%s",
+             WORKER_ID, settings.default_queue, known_types())
 
-    # Ensure schema is up to date before workers start consuming.
     db.run_migrations_sync()
 
     r = redis.Redis.from_url(settings.redis_url)

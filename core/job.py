@@ -1,12 +1,17 @@
-"""Job model — the wire format flowing through Redis.
+"""Job model and wire envelope.
 
-In Stage 1 the *whole job* travels through Redis as JSON. In Stage 2 we'll
-flip this: Redis carries only the job ID, and the row in Postgres carries
-the full state. Keeping the Job model centralized here means that change
-is a single-file edit later.
+Stage 2 split:
+- `Job` mirrors a row in the `jobs` table. It's the truth.
+- `WireEnvelope` is what travels through Redis: just the job id. Workers use
+  it to look up the row and claim it under SELECT FOR UPDATE SKIP LOCKED.
+
+The reason for the split: in Stage 1 the whole payload was on the Redis
+list, which meant losing Redis was losing jobs. Now Redis is just a fast
+ready-queue index — the row is durable.
 """
 from __future__ import annotations
 
+import json
 import uuid
 from datetime import datetime, timezone
 from typing import Any
@@ -18,35 +23,53 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _new_id() -> str:
-    # uuid4 is fine for Stage 1. We'll switch to uuid7 (time-sortable) when we
-    # need ordered enumeration in the dashboard.
-    return uuid.uuid4().hex
+def _new_id() -> uuid.UUID:
+    return uuid.uuid4()
 
 
 class Job(BaseModel):
-    id: str = Field(default_factory=_new_id)
-    type: str  # handler name, e.g. "send_email"
-    args: dict[str, Any] = Field(default_factory=dict)
-    enqueued_at: datetime = Field(default_factory=_now)
-
-    def to_wire(self) -> str:
-        # model_dump_json handles datetime → ISO 8601 for free.
-        return self.model_dump_json()
-
-    @classmethod
-    def from_wire(cls, raw: str | bytes) -> "Job":
-        if isinstance(raw, bytes):
-            raw = raw.decode("utf-8")
-        return cls.model_validate_json(raw)
-
-
-class EnqueueRequest(BaseModel):
-    """What clients POST to /jobs. Note we don't accept an id — the server mints it."""
+    """A job row. Mirrors columns in the jobs table."""
+    id: uuid.UUID = Field(default_factory=_new_id)
     type: str
     args: dict[str, Any] = Field(default_factory=dict)
+    status: str = "queued"   # queued | running | done | failed
+    queue: str = "default"
+    attempts: int = 0
+    max_attempts: int = 3
+    enqueued_at: datetime = Field(default_factory=_now)
+    started_at: datetime | None = None
+    completed_at: datetime | None = None
+    last_heartbeat_at: datetime | None = None
+    locked_by: str | None = None
+    error: str | None = None
+
+
+class WireEnvelope(BaseModel):
+    """What goes onto the Redis list. Tiny on purpose."""
+    id: uuid.UUID
+
+    def to_wire(self) -> bytes:
+        # bytes, not str — redis-py handles either, but bytes is what BLPOP returns
+        # on the worker side, so we keep both ends symmetric.
+        return json.dumps({"id": str(self.id)}).encode("utf-8")
+
+    @classmethod
+    def from_wire(cls, raw: str | bytes) -> "WireEnvelope":
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8")
+        data = json.loads(raw)
+        return cls(id=uuid.UUID(data["id"]))
+
+
+# Producer HTTP schemas -------------------------------------------------------
+
+class EnqueueRequest(BaseModel):
+    type: str
+    args: dict[str, Any] = Field(default_factory=dict)
+    max_attempts: int = 3
 
 
 class EnqueueResponse(BaseModel):
-    id: str
+    id: uuid.UUID
     queue: str
+    status: str
